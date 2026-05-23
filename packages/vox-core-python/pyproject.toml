@@ -1,0 +1,25 @@
+[project]
+name = "vox-core-python"
+version = "0.1.0"
+description = "Voice processing pipeline for Vox Assistant"
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+  # STREAMING_CHUNK:Configuring dependencies...
+  "structlog>=24.1.0",
+  "pydantic>=2.7.0",
+  # We will add ml dependencies later (whisper, etc)
+  "faster-whisper>=1.2.1",
+  "numpy>=2.4.6",
+  "librosa>=0.11.0",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.uv]
+managed = true
+
+[project.scripts]
+vox-pipeline = "vox_core_python.cli:main"

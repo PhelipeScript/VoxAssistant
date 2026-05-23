@@ -1,0 +1,53 @@
+# OS / editor
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+# Node / frontend
+node_modules/
+**/node_modules/
+dist/
+**/dist/
+dist-ssr/
+coverage/
+.vite/
+**/.vite/
+*.tsbuildinfo
+
+# Rust / Tauri
+target/
+**/target/
+
+# Python
+__pycache__/
+**/__pycache__/
+*.py[cod]
+.python-version
+.venv/
+venv/
+env/
+.env
+.env.*
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.hypothesis/
+.pyre/
+.pytype/
+pip-wheel-metadata/
+*.egg-info/
