@@ -6,8 +6,10 @@ import librosa
 import structlog
 from pydantic import BaseModel
 from faster_whisper import WhisperModel
+import openwakeword
+import ollama
+from openwakeword.model import Model
 
-# Importa o nosso novo classificador
 from .intent import CommandRegistry
 
 structlog.configure(
@@ -19,16 +21,17 @@ structlog.configure(
 )
 log = structlog.get_logger()
 
-log.info("loading_whisper_model", model="small", compute_type="int8")
-model = WhisperModel("small", device="cpu", compute_type="int8")
-log.info("whisper_model_loaded")
+# Inicializa IA do Whisper (Transcrição)
+log.info("loading_whisper_model", model="small")
+whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
-# Inicializa e popula os comandos (Fase 1: Mock de Banco de Dados)
+# Inicializa IA do WakeWord (Jarvis)
+log.info("loading_wakeword_model", model="hey_jarvis")
+openwakeword.utils.download_models() # Garante que os modelos oficiais estão baixados
+oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
+
+# Inicializa a Árvore de Comandos
 registry = CommandRegistry()
-registry.register("spotify_play", "play_music", ["toca música", "tocar música", "play", "solta o som"])
-registry.register("system_time", "get_time", ["que horas são", "me diga as horas", "horas"])
-registry.register("browser_open", "open_chrome", ["abrir chrome", "abre o navegador", "navegar na internet"])
-log.info("command_registry_loaded", total_commands=len(registry.commands_data))
 
 class CoreMessage(BaseModel):
     type: str
@@ -37,64 +40,128 @@ class CoreMessage(BaseModel):
 class PipelineResponse(BaseModel):
     type: str
     payload: dict
-    
-def handle_message(msg: CoreMessage) -> PipelineResponse:
-    if msg.type == "ping":
+
+# Máquina de estados no Python
+class AudioState:
+    def __init__(self):
+        self.is_listening_for_command = False
+        self.speech_buffer = []
+
+state = AudioState()
+
+def handle_message(msg: CoreMessage) -> PipelineResponse | None:
+    if msg.type == "config_reloaded":
+        db_path = msg.payload.get("db_path")
+        try:
+            count = registry.load_from_db(db_path)
+            log.info("command_registry_reloaded", total_commands=count)
+            return PipelineResponse(type="status", payload={"status": f"{count} comandos ativos"})
+        except Exception as e:
+            return PipelineResponse(type="error", payload={"message": str(e)})
+
+    elif msg.type == "ping":
         return PipelineResponse(type="pong", payload={"status": "ok"})
         
-    elif msg.type == "audio_chunk":
+    elif msg.type == "audio_stream":
+        # Recebendo fluxo contínuo do microfone
         b64_data = msg.payload.get("audio_b64")
-        if b64_data:
-            audio_bytes = base64.b64decode(b64_data)
-            audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+        if not b64_data: return None
+        
+        audio_bytes = base64.b64decode(b64_data)
+        audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
+        
+        # O Mac manda 48kHz, todas as IAs precisam de 16kHz
+        audio_16k = librosa.resample(y=audio_array, orig_sr=48000, target_sr=16000)
+        
+        # 1. Se estiver esperando o Jarvis
+        if not state.is_listening_for_command:
+            # OpenWakeWord exige Int16
+            audio_i16 = (audio_16k * 32767.0).astype(np.int16)
+            prediction = oww_model.predict(audio_i16)
             
-            audio_16k = librosa.resample(y=audio_array, orig_sr=48000, target_sr=16000)
+            # Checa o score (0 a 1) para o modelo "hey_jarvis"
+            score = prediction.get("hey_jarvis", 0.0)
+            if score > 0.4:  # Threshold seguro
+                log.info("wakeword_detected", score=score)
+                state.is_listening_for_command = True
+                state.speech_buffer = []
+                return PipelineResponse(type="wakeword_status", payload={"status": "listening"})
+            return None
             
-            log.info("transcribing...")
-            segments, info = model.transcribe(
-                audio_16k, 
-                beam_size=1, 
-                language="pt",
-                condition_on_previous_text=False
-            )
+        # 2. Se o Jarvis acordou, ele está ouvindo e acumulando a frase
+        else:
+            state.speech_buffer.append(audio_16k)
+            return None
+
+    elif msg.type == "audio_silence":
+        # O Rust avisa que o usuário parou de falar
+        if state.is_listening_for_command and len(state.speech_buffer) > 0:
+            log.info("processing_command")
             
+            # Junta todos os bloquinhos do buffer
+            full_audio = np.concatenate(state.speech_buffer)
+            
+            # Se foi só um barulho rápido, ignora
+            if len(full_audio) < 16000: # menos de 1 segundo
+                state.is_listening_for_command = False
+                state.speech_buffer = []
+                return PipelineResponse(type="wakeword_status", payload={"status": "idle"})
+
+            # Manda pro Whisper
+            segments, _ = whisper_model.transcribe(full_audio, beam_size=1, language="pt", condition_on_previous_text=False)
             text = " ".join([segment.text for segment in segments]).strip()
             
-            # --- MÁGICA DA INTENÇÃO AQUI ---
+            # Manda pra Árvore de Intenções
             intent = registry.classify(text)
             
+            # Reseta estado e manda resposta
+            state.is_listening_for_command = False
+            state.speech_buffer = []
+            
+            # NOVO CÉREBRO: Se não reconheceu o comando, pergunta pro Ollama!
+            if intent.method == "unmatched":
+                log.info("asking_ollama", prompt=text)
+                try:
+                    # Usamos o llama3 para responder de forma concisa
+                    prompt = f"Responda de forma curta e direta em português: {text}"
+                    response = ollama.chat(model='llama3', messages=[{'role': 'user', 'content': prompt}])
+                    
+                    llm_text = response['message']['content']
+                    
+                    return PipelineResponse(
+                        type="llm_response", 
+                        payload={"transcript": text, "response": llm_text}
+                    )
+                except Exception as e:
+                    log.error("ollama_error", error=str(e))
+                    return PipelineResponse(
+                        type="llm_response", 
+                        payload={"transcript": text, "response": "Erro: O Ollama não está rodando no fundo."}
+                    )
+            
+            # Se reconheceu, segue o fluxo normal de ação
             return PipelineResponse(
                 type="intent_match", 
-                payload={
-                    "transcript": text,
-                    "intent": intent.model_dump()
-                }
+                payload={"transcript": text, "intent": intent.model_dump()}
             )
-        
-        return PipelineResponse(type="error", payload={"message": "Nenhum áudio recebido"})
-        
-    else:
-        return PipelineResponse(type="error", payload={"message": f"Tipo desconhecido: {msg.type}"})
+        return None
 
 def main():
-    log.info("pipeline_started", version="0.1.0")
     try:
         for line in sys.stdin:
             line = line.strip()
-            if not line:
-                continue
+            if not line: continue
             try:
                 raw_msg = json.loads(line)
                 msg = CoreMessage(**raw_msg)
                 response = handle_message(msg)
-                print(response.model_dump_json(), flush=True)
+                # Só imprime (devolve pro Rust) se houver resposta
+                if response:
+                    print(response.model_dump_json(), flush=True)
             except Exception as e:
                 log.error("pipeline_error", error=str(e))
-                print(PipelineResponse(type="error", payload={"message": str(e)}).model_dump_json(), flush=True)
     except KeyboardInterrupt:
         pass
-    finally:
-        log.info("pipeline_stopped")
 
 if __name__ == "__main__":
     main()
