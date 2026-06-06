@@ -37,6 +37,15 @@ pub struct TtsState {
     pub engine: Mutex<Tts>,
 }
 
+fn play_mac_sound(sound_name: &str) {
+    let sound_path = format!("/System/Library/Sounds/{}.aiff", sound_name);
+    std::thread::spawn(move || {
+        let _ = std::process::Command::new("afplay")
+            .arg(sound_path)
+            .output();
+    });
+}
+
 fn dispatch_action(action: &str, command_id: &str) {
     println!("⚡ [Action Dispatcher] Executando ação: {} (Comando: {})", action, command_id);
     
@@ -239,9 +248,15 @@ pub fn run() {
                                         let _ = app_handle_clone.emit("pipeline-response", msg.clone());
                                     }
                                     
+                                    // Intercepta e muda a UI quando o Jarvis acordar/dormir
                                     if msg.msg_type == "wakeword_status" {
                                         if let Some(status) = msg.payload.get("status").and_then(|v| v.as_str()) {
                                             let _ = app_handle_clone.emit("wakeword-status", status);
+                                            
+                                            // NOVO: Toca o som clássico quando ele começa a ouvir
+                                            if status == "listening" {
+                                                play_mac_sound("Tink"); // Um "plim" suave
+                                            }
                                         }
                                     }
 
@@ -269,11 +284,8 @@ pub fn run() {
                                                 let action = intent.get("action").and_then(|v| v.as_str()).unwrap_or("");
                                                 let command_id = intent.get("command_id").and_then(|v| v.as_str()).unwrap_or("");
                                                 
-                                                // Feedback de voz opcional ao executar comandos nativos
-                                                let state = app_handle_clone.state::<TtsState>();
-                                                if let Ok(mut tts_engine) = state.engine.lock() {
-                                                    let _ = tts_engine.speak("Executando.", true);
-                                                }
+                                                // NOVO: Feedback sonoro de sucesso!
+                                                play_mac_sound("Pop");
 
                                                 dispatch_action(action, command_id);
                                             } else {
