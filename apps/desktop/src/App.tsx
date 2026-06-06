@@ -1,4 +1,4 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useRef } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 
@@ -13,6 +13,8 @@ interface CommandEntry {
   phrases: string;
 }
 
+type ChatMessage = { id: number; role: 'user' | 'jarvis'; text: string };
+
 function App() {
   const [pipelineStatus, setPipelineStatus] = useState<string>("Desconectado");
   const [lastResponse, setLastResponse] = useState<PipelineMessage | null>(null);
@@ -20,16 +22,44 @@ function App() {
   const [isRecording, setIsRecording] = useState(false); // Hardware do mic ligado/desligado
   const [jarvisAwake, setJarvisAwake] = useState(false); // IA prestando atenção no comando
   
-  const [llmMessage, setLlmMessage] = useState<string>("");
+  // NOVO: Array de mensagens e referência para o scroll descer sozinho
+  const [chat, setChat] = useState<ChatMessage[]>([]);
+  const chatEndRef = useRef<HTMLDivElement>(null);
+
   const [commands, setCommands] = useState<CommandEntry[]>([]);
   const [newCmd, setNewCmd] = useState<CommandEntry>({ id: "", action: "", phrases: "" });
+
+  // NOVO: Auto-scroll sempre que uma mensagem chegar
+  useEffect(() => {
+    chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [chat]);
 
   useEffect(() => {
     // Escuta as respostas do Python
     const unlisten = listen<PipelineMessage>("pipeline-response", (event) => {
-      setLastResponse(event.payload);
-      if (event.payload.type === "pong") {
+      const msg = event.payload;
+      setLastResponse(msg);
+
+      if (msg.type === "pong") {
         setPipelineStatus("Conectado (Ping Ok)");
+      } 
+      // Captura as conversas com o LLM
+      else if (msg.type === "llm_response") {
+        setChat((prev) => [
+          ...prev,
+          { id: Date.now(), role: "user", text: msg.payload.transcript },
+          { id: Date.now() + 1, role: "jarvis", text: msg.payload.response }
+        ]);
+      } 
+      // Captura os comandos nativos (como modo escuro, youtube)
+      else if (msg.type === "intent_match") {
+        if (msg.payload.intent.method !== "unmatched") {
+          setChat((prev) => [
+            ...prev,
+            { id: Date.now(), role: "user", text: msg.payload.transcript },
+            { id: Date.now() + 1, role: "jarvis", text: `⚡ Executando: ${msg.payload.intent.action}` }
+          ]);
+        }
       }
     });
 
@@ -42,10 +72,6 @@ function App() {
       }
     });
 
-    // Escuta respostas do LLM (Ollama)
-    const unlistenLlm = listen<string>("llm-response", (event) => {
-      setLlmMessage(event.payload);
-    });
 
     invoke("send_to_pipeline", { message: { type: "ping", payload: {} } });
     fetchCommands();
@@ -53,7 +79,6 @@ function App() {
     return () => {
       unlisten.then((fn) => fn());
       unlistenWakeWord.then((fn) => fn());
-      unlistenLlm.then((fn) => fn());
     };
   }, []);
 
@@ -132,21 +157,28 @@ function App() {
             </p>
           </div>
 
-          <div className="bg-slate-900 text-emerald-400 p-4 rounded-xl font-mono text-sm overflow-auto h-72 shadow-inner border border-slate-800">
-            <p className="text-slate-400 mb-2 border-b border-slate-700 pb-2">// Live Pipeline Log</p>
-            <pre className="whitespace-pre-wrap break-words">
-              {/* {lastResponse ? JSON.stringify(lastResponse, null, 2) : "Aguardando..."} */}
-              {llmMessage && (
-                <div className="text-emerald-400">
-                  <strong>🤖 Jarvis (LLM):</strong> {llmMessage}
+          {/* Painel de Chat Estilo iMessage / WhatsApp */}
+          <div className="bg-slate-900 rounded-xl border border-slate-700 shadow-inner p-4 h-96 overflow-y-auto flex flex-col gap-4 mb-6">
+            {chat.length === 0 ? (
+              <div className="text-slate-500 text-center m-auto">
+                Diga "Hey Jarvis" para começar a conversa...
+              </div>
+            ) : (
+              chat.map((msg) => (
+                <div key={msg.id} className={`flex ${msg.role === 'user' ? 'justify-end' : 'justify-start'}`}>
+                  <div className={`max-w-[85%] p-3 rounded-2xl ${
+                    msg.role === 'user' 
+                      ? 'bg-emerald-600 text-white rounded-br-none shadow-md' 
+                      : 'bg-slate-800 border border-slate-700 text-blue-100 rounded-bl-none shadow-md'
+                  }`}>
+                    {msg.role === 'jarvis' && <span className="text-xs text-blue-400 font-bold block mb-1">Jarvis</span>}
+                    <p className="text-sm leading-relaxed">{msg.text}</p>
+                  </div>
                 </div>
-              )}
-              {lastResponse && lastResponse?.type != 'llm_response' && (
-                <div className="mt-2">
-                  <strong className="text-slate-400">📡 Pipeline:</strong> {lastResponse.type} - {JSON.stringify(lastResponse.payload)}
-                </div>
-              )}
-            </pre>
+              ))
+            )}
+            {/* Div fantasma para o scroll descer automaticamente */}
+            <div ref={chatEndRef} />
           </div>
         </div>
 
