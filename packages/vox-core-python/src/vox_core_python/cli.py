@@ -4,6 +4,7 @@ import base64
 import numpy as np
 import librosa
 import structlog
+import subprocess
 from pydantic import BaseModel
 from faster_whisper import WhisperModel
 import openwakeword
@@ -47,7 +48,7 @@ class AudioState:
         self.is_listening_for_command = False
         self.speech_buffer = []
         
-        # NOVO: Memória de Conversa e Personalidade do Jarvis!
+        # Memória de Conversa e Personalidade do Jarvis!
         self.chat_history = [
             {
                 "role": "system", 
@@ -57,34 +58,80 @@ class AudioState:
 
 state = AudioState()
 
-def handle_message(msg: CoreMessage) -> PipelineResponse | None:
-    # NOVO: Se receber texto digitado pelo React
-    if msg.type == "text_input":
-        text = msg.payload.get("text", "")
-        log.info("text_received", text=text)
-        
-        # Repete a mesma lógica da voz! Tenta classificar:
-        intent = registry.classify(text)
-        
-        if intent.method != "unmatched":
-            return PipelineResponse(
-                type="intent_match", 
-                payload={"transcript": text, "intent": intent.model_dump()}
-            )
-        else:
-            # Se não for comando nativo, manda pro Llama 3 (com memória)
+# ==========================================
+# CÉREBRO CENTRAL (Texto e Voz passam por aqui)
+# ==========================================
+def process_intent_or_llm(text: str, intent) -> PipelineResponse:
+    if intent.method != "unmatched":
+        # 1. Intercepta a Área de Transferência
+        if intent.action and intent.action.startswith("llm_clipboard:"):
+            try:
+                # Usa o comando nativo pbpaste do Mac
+                clipboard_text = subprocess.check_output(['pbpaste'], text=True).strip()
+                instrucao = intent.action.replace("llm_clipboard:", "").strip()
+                
+                texto_final = f"{instrucao}\n\nTexto copiado:\n{clipboard_text}"
+                
+                # Adiciona na memória e chama o Llama 3
+                state.chat_history.append({"role": "user", "content": texto_final})
+                if len(state.chat_history) > 11:
+                    state.chat_history.pop(1)
+                    
+                response = ollama.chat(model='llama3', messages=state.chat_history)
+                llm_text = response['message']['content']
+                state.chat_history.append({"role": "assistant", "content": llm_text})
+                
+                return PipelineResponse(
+                    type="llm_response", 
+                    payload={"transcript": text, "response": llm_text}
+                )
+            except Exception as e:
+                log.error("clipboard_error", error=str(e))
+                return PipelineResponse(
+                    type="llm_response", 
+                    payload={"transcript": text, "response": "Houve um erro ao ler a área de transferência do Mac."}
+                )
+
+        # 2. Se for um comando normal (open:, sh:), segue para o Rust executar
+        return PipelineResponse(
+            type="intent_match", 
+            payload={"transcript": text, "intent": intent.model_dump()}
+        )
+    else:
+        # 3. Conversa livre com o Llama 3 (Com Memória)
+        log.info("asking_ollama", prompt=text)
+        try:
             state.chat_history.append({"role": "user", "content": text})
             if len(state.chat_history) > 11:
                 state.chat_history.pop(1)
                 
             response = ollama.chat(model='llama3', messages=state.chat_history)
             llm_text = response['message']['content']
+            
             state.chat_history.append({"role": "assistant", "content": llm_text})
             
             return PipelineResponse(
                 type="llm_response", 
                 payload={"transcript": text, "response": llm_text}
             )
+        except Exception as e:
+            log.error("ollama_error", error=str(e))
+            return PipelineResponse(
+                type="llm_response", 
+                payload={"transcript": text, "response": "Erro de conexão com o cérebro principal."}
+            )
+
+# ==========================================
+# ROTEADOR DE MENSAGENS (Tauri -> Python)
+# ==========================================
+def handle_message(msg: CoreMessage) -> PipelineResponse | None:
+    
+    # Recebendo texto digitado pelo React
+    if msg.type == "text_input":
+        text = msg.payload.get("text", "")
+        log.info("text_received", text=text)
+        intent = registry.classify(text)
+        return process_intent_or_llm(text, intent)
 
     elif msg.type == "config_reloaded":
         db_path = msg.payload.get("db_path")
@@ -99,95 +146,51 @@ def handle_message(msg: CoreMessage) -> PipelineResponse | None:
         return PipelineResponse(type="pong", payload={"status": "ok"})
         
     elif msg.type == "audio_stream":
-        # Recebendo fluxo contínuo do microfone
         b64_data = msg.payload.get("audio_b64")
         if not b64_data: return None
         
         audio_bytes = base64.b64decode(b64_data)
         audio_array = np.frombuffer(audio_bytes, dtype=np.float32)
-        
-        # O Mac manda 48kHz, todas as IAs precisam de 16kHz
         audio_16k = librosa.resample(y=audio_array, orig_sr=48000, target_sr=16000)
         
-        # 1. Se estiver esperando o Jarvis
         if not state.is_listening_for_command:
-            # OpenWakeWord exige Int16
             audio_i16 = (audio_16k * 32767.0).astype(np.int16)
             prediction = oww_model.predict(audio_i16)
             
-            # Checa o score (0 a 1) para o modelo "hey_jarvis"
             score = prediction.get("hey_jarvis", 0.0)
-            if score > 0.4:  # Threshold seguro
+            if score > 0.4:
                 log.info("wakeword_detected", score=score)
                 state.is_listening_for_command = True
                 state.speech_buffer = []
                 return PipelineResponse(type="wakeword_status", payload={"status": "listening"})
             return None
             
-        # 2. Se o Jarvis acordou, ele está ouvindo e acumulando a frase
         else:
             state.speech_buffer.append(audio_16k)
             return None
 
     elif msg.type == "audio_silence":
-        # O Rust avisa que o usuário parou de falar
         if state.is_listening_for_command and len(state.speech_buffer) > 0:
             log.info("processing_command")
-            
-            # Junta todos os bloquinhos do buffer
             full_audio = np.concatenate(state.speech_buffer)
             
-            # Se foi só um barulho rápido, ignora
-            if len(full_audio) < 16000: # menos de 1 segundo
+            if len(full_audio) < 16000:
                 state.is_listening_for_command = False
                 state.speech_buffer = []
                 return PipelineResponse(type="wakeword_status", payload={"status": "idle"})
 
-            # Manda pro Whisper
+            # Transcreve o áudio
             segments, _ = whisper_model.transcribe(full_audio, beam_size=1, language="pt", condition_on_previous_text=False)
             text = " ".join([segment.text for segment in segments]).strip()
             
-            # Manda pra Árvore de Intenções
-            intent = registry.classify(text)
-            
-            # Reseta estado e manda resposta
+            # Reseta estado do áudio
             state.is_listening_for_command = False
             state.speech_buffer = []
             
-            # NOVO CÉREBRO: Com memória de contexto!
-            if intent.method == "unmatched":
-                log.info("asking_ollama", prompt=text)
-                try:
-                    # 1. Adiciona o que você acabou de falar na memória
-                    state.chat_history.append({"role": "user", "content": text})
-                    
-                    # 2. Evita que a memória cresça infinitamente (Mantém o System Prompt + últimas 10 mensagens)
-                    if len(state.chat_history) > 11:
-                        state.chat_history.pop(1)
-                    
-                    # 3. Manda a conversa INTEIRA para o Ollama analisar
-                    response = ollama.chat(model='llama3', messages=state.chat_history)
-                    llm_text = response['message']['content']
-                    
-                    # 4. Salva a resposta que ele deu para que ele lembre na próxima!
-                    state.chat_history.append({"role": "assistant", "content": llm_text})
-                    
-                    return PipelineResponse(
-                        type="llm_response", 
-                        payload={"transcript": text, "response": llm_text}
-                    )
-                except Exception as e:
-                    log.error("ollama_error", error=str(e))
-                    return PipelineResponse(
-                        type="llm_response", 
-                        payload={"transcript": text, "response": "Erro de conexão com o cérebro principal."}
-                    )
+            # Repassa pro cérebro central
+            intent = registry.classify(text)
+            return process_intent_or_llm(text, intent)
             
-            # Se reconheceu, segue o fluxo normal de ação
-            return PipelineResponse(
-                type="intent_match", 
-                payload={"transcript": text, "intent": intent.model_dump()}
-            )
         return None
 
 def main():
@@ -199,7 +202,6 @@ def main():
                 raw_msg = json.loads(line)
                 msg = CoreMessage(**raw_msg)
                 response = handle_message(msg)
-                # Só imprime (devolve pro Rust) se houver resposta
                 if response:
                     print(response.model_dump_json(), flush=True)
             except Exception as e:
