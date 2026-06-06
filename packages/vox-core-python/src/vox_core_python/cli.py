@@ -58,7 +58,35 @@ class AudioState:
 state = AudioState()
 
 def handle_message(msg: CoreMessage) -> PipelineResponse | None:
-    if msg.type == "config_reloaded":
+    # NOVO: Se receber texto digitado pelo React
+    if msg.type == "text_input":
+        text = msg.payload.get("text", "")
+        log.info("text_received", text=text)
+        
+        # Repete a mesma lógica da voz! Tenta classificar:
+        intent = registry.classify(text)
+        
+        if intent.method != "unmatched":
+            return PipelineResponse(
+                type="intent_match", 
+                payload={"transcript": text, "intent": intent.model_dump()}
+            )
+        else:
+            # Se não for comando nativo, manda pro Llama 3 (com memória)
+            state.chat_history.append({"role": "user", "content": text})
+            if len(state.chat_history) > 11:
+                state.chat_history.pop(1)
+                
+            response = ollama.chat(model='llama3', messages=state.chat_history)
+            llm_text = response['message']['content']
+            state.chat_history.append({"role": "assistant", "content": llm_text})
+            
+            return PipelineResponse(
+                type="llm_response", 
+                payload={"transcript": text, "response": llm_text}
+            )
+
+    elif msg.type == "config_reloaded":
         db_path = msg.payload.get("db_path")
         try:
             count = registry.load_from_db(db_path)

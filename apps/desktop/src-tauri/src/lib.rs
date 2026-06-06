@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use std::process::Stdio;
 use tauri::{Emitter, Manager, State};
+use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
+use tauri::ActivationPolicy;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
@@ -87,8 +89,19 @@ fn dispatch_action(action: &str, command_id: &str) {
 }
 
 #[tauri::command]
-async fn send_to_pipeline(state: State<'_, PipelineState>, message: PipelineMessage) -> Result<(), String> {
-    state.tx.send(message).await.map_err(|e| e.to_string())
+async fn send_to_pipeline(
+    message: serde_json::Value,
+    pipeline_state: tauri::State<'_, PipelineState>,
+) -> Result<(), String> {
+    // Extrai o tipo e o payload que vieram do React
+    let msg_type = message.get("type").and_then(|v| v.as_str()).unwrap_or("").to_string();
+    let payload = message.get("payload").cloned().unwrap_or(serde_json::json!({}));
+
+    // Cria a mensagem estruturada e envia para o canal do Python
+    let pipeline_msg = PipelineMessage { msg_type, payload };
+    pipeline_state.tx.send(pipeline_msg).await.map_err(|e| e.to_string())?;
+    
+    Ok(())
 }
 
 #[tauri::command]
@@ -129,6 +142,32 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .setup(|app| {
+            // ==========================================
+            // NOVO: Oculta do Dock e cria o ícone no Tray
+            // ==========================================
+            #[cfg(target_os = "macos")]
+            app.set_activation_policy(ActivationPolicy::Accessory);
+
+            let tray = TrayIconBuilder::new()
+                .icon(app.default_window_icon().unwrap().clone())
+                .tooltip("Jarvis AI")
+                .on_tray_icon_event(|tray, event| match event {
+                    TrayIconEvent::Click { button: MouseButton::Left, button_state: MouseButtonState::Up, .. } => {
+                        let app = tray.app_handle();
+                        if let Some(window) = app.get_webview_window("main") {
+                            if window.is_visible().unwrap_or(false) {
+                                let _ = window.hide();
+                            } else {
+                                let _ = window.show();
+                                let _ = window.set_focus();
+                            }
+                        }
+                    }
+                    _ => {}
+                })
+                .build(app)?;
+            // ==========================================
+
             let current_dir = env::current_dir().unwrap();
             let monorepo_root = current_dir.parent().unwrap().parent().unwrap().parent().unwrap();
             
