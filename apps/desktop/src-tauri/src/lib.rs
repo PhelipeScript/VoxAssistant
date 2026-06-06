@@ -137,6 +137,29 @@ async fn add_command(
     Ok(())
 }
 
+#[tauri::command]
+async fn delete_command(
+    id: String,
+    state: tauri::State<'_, AppState>,
+    pipeline: tauri::State<'_, PipelineState>,
+) -> Result<(), String> {
+    // 1. Conecta no banco correto usando o estado do app
+    let conn = rusqlite::Connection::open(&state.db_path).map_err(|e| e.to_string())?;
+    
+    // 2. Deleta o comando
+    conn.execute("DELETE FROM commands WHERE id = ?1", rusqlite::params![id])
+        .map_err(|e| e.to_string())?;
+        
+    // 3. Avisa o Python para recarregar a memória e "esquecer" esse comando
+    let msg = PipelineMessage {
+        msg_type: "config_reloaded".to_string(),
+        payload: serde_json::json!({ "db_path": state.db_path }),
+    };
+    let _ = pipeline.tx.send(msg).await;
+        
+    Ok(())
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
@@ -381,7 +404,8 @@ pub fn run() {
             start_recording, 
             stop_recording,
             get_commands,
-            add_command
+            add_command,
+            delete_command,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

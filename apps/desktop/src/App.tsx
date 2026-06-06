@@ -25,6 +25,16 @@ export default function App() {
   const [newCmd, setNewCmd] = useState<CommandEntry>({ id: "", action: "", phrases: "" });
   const chatEndRef = useRef<HTMLDivElement>(null);
 
+  const [thinkingText, setThinkingText] = useState("Pensando...");
+  const thinkingTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+
+  // NOVO: Função para deletar comando
+  const handleDeleteCommand = async (id: string) => {
+    await invoke("delete_command", { id });
+    // Recarrega a lista do banco
+    setCommands(await invoke("get_commands")); 
+  };
+
   // Auto-scroll do chat
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -65,10 +75,19 @@ export default function App() {
     const unlistenWake = listen<string>("wakeword-status", (event) => {
       if (event.payload === "listening") {
         setAiState("listening");
+        if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
       } else if (event.payload === "processing") {
         setAiState("thinking");
+        setThinkingText("Analisando...");
+        
+        // Se demorar mais de 3 segundos, muda o texto para acalmar o usuário
+        thinkingTimeoutRef.current = setTimeout(() => {
+          setThinkingText("Processando contexto, só um instante...");
+        }, 3000);
+
       } else {
         setAiState("idle");
+        if (thinkingTimeoutRef.current) clearTimeout(thinkingTimeoutRef.current);
       }
     });
 
@@ -129,7 +148,7 @@ export default function App() {
       <div className="flex flex-col items-center justify-center py-6">
         <div className={`w-16 h-16 rounded-full transition-all duration-300 ${states[aiState]}`} />
         <span className="text-xs text-slate-400 mt-3 font-medium uppercase tracking-widest">
-          {aiState}
+          {aiState === "thinking" ? thinkingText : aiState}
         </span>
       </div>
     );
@@ -218,6 +237,13 @@ export default function App() {
                 <div key={c.id} className="bg-slate-800/50 p-3 rounded-lg border border-slate-700/50">
                   <div className="flex justify-between items-center mb-1">
                     <span className="text-emerald-400 font-mono text-xs">{c.id}</span>
+                    <button 
+                      onClick={() => handleDeleteCommand(c.id)}
+                      className="text-red-500 hover:text-red-400 text-xs p-1"
+                      title="Deletar Comando"
+                    >
+                      🗑️
+                    </button>
                   </div>
                   <div className="text-xs text-slate-400 break-all">{c.action}</div>
                 </div>
