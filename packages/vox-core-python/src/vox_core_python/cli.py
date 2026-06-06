@@ -5,6 +5,7 @@ import numpy as np
 import librosa
 import structlog
 import subprocess
+import sqlite3  # NOVO: Para gerenciar a memória de longo prazo
 from pydantic import BaseModel
 from faster_whisper import WhisperModel
 import openwakeword
@@ -28,7 +29,7 @@ whisper_model = WhisperModel("small", device="cpu", compute_type="int8")
 
 # Inicializa IA do WakeWord (Jarvis)
 log.info("loading_wakeword_model", model="hey_jarvis")
-openwakeword.utils.download_models() # Garante que os modelos oficiais estão baixados
+openwakeword.utils.download_models()
 oww_model = Model(wakeword_models=["hey_jarvis"], inference_framework="onnx")
 
 # Inicializa a Árvore de Comandos
@@ -47,8 +48,9 @@ class AudioState:
     def __init__(self):
         self.is_listening_for_command = False
         self.speech_buffer = []
+        self.db_path = None  # NOVO: Guarda o caminho do banco de dados
         
-        # Memória de Conversa e Personalidade do Jarvis!
+        # Memória de Curto Prazo (Sessão atual)
         self.chat_history = [
             {
                 "role": "system", 
@@ -59,20 +61,17 @@ class AudioState:
 state = AudioState()
 
 # ==========================================
-# CÉREBRO CENTRAL (Texto e Voz passam por aqui)
+# CÉREBRO CENTRAL (Texto e Voz com RAG)
 # ==========================================
 def process_intent_or_llm(text: str, intent) -> PipelineResponse:
     if intent.method != "unmatched":
         # 1. Intercepta a Área de Transferência
         if intent.action and intent.action.startswith("llm_clipboard:"):
             try:
-                # Usa o comando nativo pbpaste do Mac
                 clipboard_text = subprocess.check_output(['pbpaste'], text=True).strip()
                 instrucao = intent.action.replace("llm_clipboard:", "").strip()
-                
                 texto_final = f"{instrucao}\n\nTexto copiado:\n{clipboard_text}"
                 
-                # Adiciona na memória e chama o Llama 3
                 state.chat_history.append({"role": "user", "content": texto_final})
                 if len(state.chat_history) > 11:
                     state.chat_history.pop(1)
@@ -81,27 +80,19 @@ def process_intent_or_llm(text: str, intent) -> PipelineResponse:
                 llm_text = response['message']['content']
                 state.chat_history.append({"role": "assistant", "content": llm_text})
                 
-                return PipelineResponse(
-                    type="llm_response", 
-                    payload={"transcript": text, "response": llm_text}
-                )
+                return PipelineResponse(type="llm_response", payload={"transcript": text, "response": llm_text})
             except Exception as e:
                 log.error("clipboard_error", error=str(e))
-                return PipelineResponse(
-                    type="llm_response", 
-                    payload={"transcript": text, "response": "Houve um erro ao ler a área de transferência do Mac."}
-                )
-        # 1.5 Intercepta a Telemetria do Sistema (Hardware)
+                return PipelineResponse(type="llm_response", payload={"transcript": text, "response": "Houve um erro ao ler o clipboard."})
+
+        # 1.5 Telemetria de Hardware
         elif intent.action and intent.action.startswith("sys_info:"):
             try:
-                # Usa o comando nativo do Mac para ler CPU e RAM rapidamente
                 comando_mac = "top -l 1 | awk '/CPU usage/ || /PhysMem/'"
                 sys_data = subprocess.check_output(comando_mac, shell=True, text=True).strip()
-                
                 instrucao = intent.action.replace("sys_info:", "").strip()
                 texto_final = f"{instrucao}\n\nDados Brutos do Kernel:\n{sys_data}"
                 
-                # Adiciona na memória e chama o Llama 3 para interpretar
                 state.chat_history.append({"role": "user", "content": texto_final})
                 if len(state.chat_history) > 11:
                     state.chat_history.pop(1)
@@ -110,31 +101,19 @@ def process_intent_or_llm(text: str, intent) -> PipelineResponse:
                 llm_text = response['message']['content']
                 state.chat_history.append({"role": "assistant", "content": llm_text})
                 
-                return PipelineResponse(
-                    type="llm_response", 
-                    payload={"transcript": text, "response": llm_text}
-                )
+                return PipelineResponse(type="llm_response", payload={"transcript": text, "response": llm_text})
             except Exception as e:
-                log.error("sysinfo_error", error=str(e))
-                return PipelineResponse(
-                    type="llm_response", 
-                    payload={"transcript": text, "response": "Senhor, perdi comunicação com os sensores da placa-mãe."}
-                )
-        # 1.6 Intercepta a Auditoria de Rede (Modo Sentinela / Blue Team)
+                return PipelineResponse(type="llm_response", payload={"transcript": text, "response": "Erro nos sensores."})
+
+        # 1.6 Sentinela (Segurança de Rede)
         elif intent.action and intent.action.startswith("net_audit:"):
             try:
-                # Usa o lsof nativo para listar portas TCP abertas (LISTEN)
-                # Limitamos a 30 linhas para não estourar a memória de contexto do LLM
                 comando_mac = "lsof -iTCP -sTCP:LISTEN -P -n | head -n 30"
                 net_data = subprocess.check_output(comando_mac, shell=True, text=True).strip()
-                
-                if not net_data:
-                    net_data = "Nenhuma porta vulnerável ou em escuta encontrada."
-                
+                if not net_data: net_data = "Nenhuma porta em escuta."
                 instrucao = intent.action.replace("net_audit:", "").strip()
                 texto_final = f"{instrucao}\n\nLog de Portas Abertas:\n{net_data}"
                 
-                # Envia o log de rede para análise de segurança do Llama 3
                 state.chat_history.append({"role": "user", "content": texto_final})
                 if len(state.chat_history) > 11:
                     state.chat_history.pop(1)
@@ -143,52 +122,103 @@ def process_intent_or_llm(text: str, intent) -> PipelineResponse:
                 llm_text = response['message']['content']
                 state.chat_history.append({"role": "assistant", "content": llm_text})
                 
-                return PipelineResponse(
-                    type="llm_response", 
-                    payload={"transcript": text, "response": llm_text}
-                )
+                return PipelineResponse(type="llm_response", payload={"transcript": text, "response": llm_text})
             except Exception as e:
-                log.error("net_audit_error", error=str(e))
-                return PipelineResponse(
-                    type="llm_response", 
-                    payload={"transcript": text, "response": "Senhor, meu acesso aos protocolos de rede e portas TCP foi bloqueado."}
-                )
+                return PipelineResponse(type="llm_response", payload={"transcript": text, "response": "Erro no firewall."})
 
-        # 2. Se for um comando normal (open:, sh:), segue para o Rust executar
-        return PipelineResponse(
-            type="intent_match", 
-            payload={"transcript": text, "intent": intent.model_dump()}
-        )
+        # Comandos normais (open:, sh:)
+        return PipelineResponse(type="intent_match", payload={"transcript": text, "intent": intent.model_dump()})
+    
     else:
-        # 3. Conversa livre com o Llama 3 (Com Memória)
-        log.info("asking_ollama", prompt=text)
-        try:
-            state.chat_history.append({"role": "user", "content": text})
-            if len(state.chat_history) > 11:
-                state.chat_history.pop(1)
+        # =======================================================
+        # 3. CONVERSA LIVRE COM RAG (MEMÓRIA DE LONGO PRAZO)
+        # =======================================================
+        log.info("asking_ollama_with_rag", prompt=text)
+        context_str = ""
+        
+        # SE TEMOS O BANCO DE DADOS, VAMOS PEGAR LEMBRANÇAS DO PASSADO!
+        if state.db_path:
+            try:
+                # 1. Transforma a sua pergunta atual em um vetor matemático
+                emb_res = ollama.embeddings(model='nomic-embed-text', prompt=text)
+                query_vector = np.array(emb_res['embedding'], dtype=np.float32)
                 
-            response = ollama.chat(model='llama3', messages=state.chat_history)
-            llm_text = response['message']['content']
+                # 2. Puxa todas as memórias antigas salvas no SQLite
+                conn = sqlite3.connect(state.db_path)
+                cursor = conn.cursor()
+                cursor.execute("SELECT text, embedding FROM memories")
+                rows = cursor.fetchall()
+                conn.close()
+                
+                # 3. Varre o banco calculando a Similaridade de Cosseno (com Numpy)
+                similarities = []
+                for row_text, row_emb_blob in rows:
+                    row_vector = np.frombuffer(row_emb_blob, dtype=np.float32)
+                    if query_vector.shape == row_vector.shape:
+                        dot = np.dot(query_vector, row_vector)
+                        norm1 = np.linalg.norm(query_vector)
+                        norm2 = np.linalg.norm(row_vector)
+                        sim = dot / (norm1 * norm2) if (norm1 > 0 and norm2 > 0) else 0.0
+                        similarities.append((sim, row_text))
+                
+                # Organiza pelas memórias mais parecidas e pega as 2 melhores
+                similarities.sort(key=lambda x: x[0], reverse=True)
+                top_memories = [txt for sim, txt in similarities[:2] if sim > 0.6] # Filtro de relevância de 60%
+                
+                if top_memories:
+                    context_str = "\n".join(top_memories)
+                    log.info("rag_memories_retrieved", count=len(top_memories))
+            except Exception as e:
+                log.error("rag_retrieval_error", error=str(e))
+
+        # Monta o pacote de envio para o Llama 3
+        messages = list(state.chat_history)
+        if context_str:
+            # Injeta as lembranças do passado como uma instrução secreta do sistema!
+            messages.append({
+                "role": "system",
+                "content": f"Fatos importantes que você lembrou de conversas passadas com o usuário:\n{context_str}\nUse esses fatos se ajudarem a responder naturalmente."
+            })
+        
+        # Adiciona a pergunta atual no fluxo
+        messages.append({"role": "user", "content": text})
+        
+        # Alimenta a memória de curto prazo local
+        state.chat_history.append({"role": "user", "content": text})
+        if len(state.chat_history) > 11:
+            state.chat_history.pop(1)
             
+        try:
+            response = ollama.chat(model='llama3', messages=messages)
+            llm_text = response['message']['content']
             state.chat_history.append({"role": "assistant", "content": llm_text})
             
-            return PipelineResponse(
-                type="llm_response", 
-                payload={"transcript": text, "response": llm_text}
-            )
+            # GRAVA ESSA CONVERSA NA MEMÓRIA DE LONGO PRAZO DO SQLITE!
+            if state.db_path:
+                try:
+                    memory_text = f"Usuário disse: {text} | Jarvis respondeu: {llm_text}"
+                    emb_res2 = ollama.embeddings(model='nomic-embed-text', prompt=memory_text)
+                    mem_vector = np.array(emb_res2['embedding'], dtype=np.float32)
+                    
+                    conn = sqlite3.connect(state.db_path)
+                    cursor = conn.cursor()
+                    cursor.execute("INSERT INTO memories (text, embedding) VALUES (?, ?)", (memory_text, mem_vector.tobytes()))
+                    conn.commit()
+                    conn.close()
+                    log.info("new_memory_stored_in_db")
+                except Exception as e:
+                    log.error("rag_storage_error", error=str(e))
+            
+            return PipelineResponse(type="llm_response", payload={"transcript": text, "response": llm_text})
         except Exception as e:
             log.error("ollama_error", error=str(e))
-            return PipelineResponse(
-                type="llm_response", 
-                payload={"transcript": text, "response": "Erro de conexão com o cérebro principal."}
-            )
+            return PipelineResponse(type="llm_response", payload={"transcript": text, "response": "Erro de conexão com o cérebro principal."})
 
 # ==========================================
 # ROTEADOR DE MENSAGENS (Tauri -> Python)
 # ==========================================
 def handle_message(msg: CoreMessage) -> PipelineResponse | None:
     
-    # Recebendo texto digitado pelo React
     if msg.type == "text_input":
         text = msg.payload.get("text", "")
         log.info("text_received", text=text)
@@ -197,6 +227,24 @@ def handle_message(msg: CoreMessage) -> PipelineResponse | None:
 
     elif msg.type == "config_reloaded":
         db_path = msg.payload.get("db_path")
+        state.db_path = db_path # Salva o caminho do banco de dados na maquina de estados
+        
+        # NOVO: Cria a tabela de memórias vetoriais se ela não existir
+        try:
+            conn = sqlite3.connect(db_path)
+            cursor = conn.cursor()
+            cursor.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    text TEXT,
+                    embedding BLOB
+                )
+            """)
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            log.error("sqlite_memories_init_failed", error=str(e))
+
         try:
             count = registry.load_from_db(db_path)
             log.info("command_registry_reloaded", total_commands=count)
@@ -226,7 +274,6 @@ def handle_message(msg: CoreMessage) -> PipelineResponse | None:
                 state.speech_buffer = []
                 return PipelineResponse(type="wakeword_status", payload={"status": "listening"})
             return None
-            
         else:
             state.speech_buffer.append(audio_16k)
             return None
@@ -241,18 +288,14 @@ def handle_message(msg: CoreMessage) -> PipelineResponse | None:
                 state.speech_buffer = []
                 return PipelineResponse(type="wakeword_status", payload={"status": "idle"})
 
-            # Transcreve o áudio
             segments, _ = whisper_model.transcribe(full_audio, beam_size=1, language="pt", condition_on_previous_text=False)
             text = " ".join([segment.text for segment in segments]).strip()
             
-            # Reseta estado do áudio
             state.is_listening_for_command = False
             state.speech_buffer = []
             
-            # Repassa pro cérebro central
             intent = registry.classify(text)
             return process_intent_or_llm(text, intent)
-            
         return None
 
 def main():
