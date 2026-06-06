@@ -46,6 +46,14 @@ class AudioState:
     def __init__(self):
         self.is_listening_for_command = False
         self.speech_buffer = []
+        
+        # NOVO: Memória de Conversa e Personalidade do Jarvis!
+        self.chat_history = [
+            {
+                "role": "system", 
+                "content": "Você é o Jarvis, um assistente virtual prestativo, muito inteligente e direto ao ponto. Responda sempre em português brasileiro e de forma natural, sem enrolação."
+            }
+        ]
 
 state = AudioState()
 
@@ -118,15 +126,23 @@ def handle_message(msg: CoreMessage) -> PipelineResponse | None:
             state.is_listening_for_command = False
             state.speech_buffer = []
             
-            # NOVO CÉREBRO: Se não reconheceu o comando, pergunta pro Ollama!
+            # NOVO CÉREBRO: Com memória de contexto!
             if intent.method == "unmatched":
                 log.info("asking_ollama", prompt=text)
                 try:
-                    # Usamos o llama3 para responder de forma concisa
-                    prompt = f"Responda de forma curta e direta em português: {text}"
-                    response = ollama.chat(model='llama3', messages=[{'role': 'user', 'content': prompt}])
+                    # 1. Adiciona o que você acabou de falar na memória
+                    state.chat_history.append({"role": "user", "content": text})
                     
+                    # 2. Evita que a memória cresça infinitamente (Mantém o System Prompt + últimas 10 mensagens)
+                    if len(state.chat_history) > 11:
+                        state.chat_history.pop(1)
+                    
+                    # 3. Manda a conversa INTEIRA para o Ollama analisar
+                    response = ollama.chat(model='llama3', messages=state.chat_history)
                     llm_text = response['message']['content']
+                    
+                    # 4. Salva a resposta que ele deu para que ele lembre na próxima!
+                    state.chat_history.append({"role": "assistant", "content": llm_text})
                     
                     return PipelineResponse(
                         type="llm_response", 
@@ -136,7 +152,7 @@ def handle_message(msg: CoreMessage) -> PipelineResponse | None:
                     log.error("ollama_error", error=str(e))
                     return PipelineResponse(
                         type="llm_response", 
-                        payload={"transcript": text, "response": "Erro: O Ollama não está rodando no fundo."}
+                        payload={"transcript": text, "response": "Erro de conexão com o cérebro principal."}
                     )
             
             # Se reconheceu, segue o fluxo normal de ação
