@@ -54,6 +54,22 @@ fn dispatch_action(action: &str, command_id: &str) {
         if let Err(e) = open::that(target) {
             println!("❌ Erro ao abrir: {}", e);
         }
+    } else if action.starts_with("sh:") {
+        // NOVO: Execução de Shell Scripts e AppleScript nativos!
+        let script = action.trim_start_matches("sh:").to_string();
+        std::thread::spawn(move || {
+            match std::process::Command::new("sh").arg("-c").arg(&script).output() {
+                Ok(output) => {
+                    if !output.status.success() {
+                        let err = String::from_utf8_lossy(&output.stderr);
+                        println!("❌ Erro no script: {}", err);
+                    } else {
+                        println!("✅ Script executado com sucesso!");
+                    }
+                }
+                Err(e) => println!("❌ Falha ao invocar terminal: {}", e),
+            }
+        });
     } else {
         match action {
             "play_music" => {
@@ -65,7 +81,7 @@ fn dispatch_action(action: &str, command_id: &str) {
                 let now = chrono::Local::now();
                 println!("🕰️ Agora são: {}", now.format("%H:%M"));
             }
-            _ => println!("⚠️ Nenhuma lógica de execução mapeada para a ação: {}", action),
+            _ => println!("⚠️ Nenhuma lógica mapeada para a ação: {}", action),
         }
     }
 }
@@ -253,9 +269,15 @@ pub fn run() {
                                         if let Some(status) = msg.payload.get("status").and_then(|v| v.as_str()) {
                                             let _ = app_handle_clone.emit("wakeword-status", status);
                                             
-                                            // NOVO: Toca o som clássico quando ele começa a ouvir
                                             if status == "listening" {
-                                                play_mac_sound("Tink"); // Um "plim" suave
+                                                // NOVO: Cala a boca do Jarvis imediatamente!
+                                                let state = app_handle_clone.state::<TtsState>();
+                                                if let Ok(mut tts_engine) = state.engine.lock() {
+                                                    let _ = tts_engine.stop();
+                                                }; // <-- O famoso ponto e vírgula salvador!
+                                                
+                                                // Toca o som de alerta que ele está ouvindo
+                                                play_mac_sound("Tink");
                                             }
                                         }
                                     }
