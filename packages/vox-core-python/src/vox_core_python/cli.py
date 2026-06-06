@@ -91,6 +91,68 @@ def process_intent_or_llm(text: str, intent) -> PipelineResponse:
                     type="llm_response", 
                     payload={"transcript": text, "response": "Houve um erro ao ler a área de transferência do Mac."}
                 )
+        # 1.5 Intercepta a Telemetria do Sistema (Hardware)
+        elif intent.action and intent.action.startswith("sys_info:"):
+            try:
+                # Usa o comando nativo do Mac para ler CPU e RAM rapidamente
+                comando_mac = "top -l 1 | awk '/CPU usage/ || /PhysMem/'"
+                sys_data = subprocess.check_output(comando_mac, shell=True, text=True).strip()
+                
+                instrucao = intent.action.replace("sys_info:", "").strip()
+                texto_final = f"{instrucao}\n\nDados Brutos do Kernel:\n{sys_data}"
+                
+                # Adiciona na memória e chama o Llama 3 para interpretar
+                state.chat_history.append({"role": "user", "content": texto_final})
+                if len(state.chat_history) > 11:
+                    state.chat_history.pop(1)
+                    
+                response = ollama.chat(model='llama3', messages=state.chat_history)
+                llm_text = response['message']['content']
+                state.chat_history.append({"role": "assistant", "content": llm_text})
+                
+                return PipelineResponse(
+                    type="llm_response", 
+                    payload={"transcript": text, "response": llm_text}
+                )
+            except Exception as e:
+                log.error("sysinfo_error", error=str(e))
+                return PipelineResponse(
+                    type="llm_response", 
+                    payload={"transcript": text, "response": "Senhor, perdi comunicação com os sensores da placa-mãe."}
+                )
+        # 1.6 Intercepta a Auditoria de Rede (Modo Sentinela / Blue Team)
+        elif intent.action and intent.action.startswith("net_audit:"):
+            try:
+                # Usa o lsof nativo para listar portas TCP abertas (LISTEN)
+                # Limitamos a 30 linhas para não estourar a memória de contexto do LLM
+                comando_mac = "lsof -iTCP -sTCP:LISTEN -P -n | head -n 30"
+                net_data = subprocess.check_output(comando_mac, shell=True, text=True).strip()
+                
+                if not net_data:
+                    net_data = "Nenhuma porta vulnerável ou em escuta encontrada."
+                
+                instrucao = intent.action.replace("net_audit:", "").strip()
+                texto_final = f"{instrucao}\n\nLog de Portas Abertas:\n{net_data}"
+                
+                # Envia o log de rede para análise de segurança do Llama 3
+                state.chat_history.append({"role": "user", "content": texto_final})
+                if len(state.chat_history) > 11:
+                    state.chat_history.pop(1)
+                    
+                response = ollama.chat(model='llama3', messages=state.chat_history)
+                llm_text = response['message']['content']
+                state.chat_history.append({"role": "assistant", "content": llm_text})
+                
+                return PipelineResponse(
+                    type="llm_response", 
+                    payload={"transcript": text, "response": llm_text}
+                )
+            except Exception as e:
+                log.error("net_audit_error", error=str(e))
+                return PipelineResponse(
+                    type="llm_response", 
+                    payload={"transcript": text, "response": "Senhor, meu acesso aos protocolos de rede e portas TCP foi bloqueado."}
+                )
 
         # 2. Se for um comando normal (open:, sh:), segue para o Rust executar
         return PipelineResponse(
